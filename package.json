@@ -1,0 +1,38 @@
+{
+  "name": "@ajanderson/pi-recap-why",
+  "version": "0.1.0",
+  "description": "One-line what-and-why session recap for Pi.",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "recap",
+    "summary"
+  ],
+  "homepage": "https://github.com/ajanderson1/agent-toolkit/tree/main/pi-extensions/pi-recap-why#readme",
+  "license": "MIT",
+  "author": "AJ Anderson",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ajanderson1/agent-toolkit.git",
+    "directory": "pi-extensions/pi-recap-why"
+  },
+  "files": [
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
