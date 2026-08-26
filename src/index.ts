@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core"
 import { complete, type Message } from "@earendil-works/pi-ai/compat"
+import type { ProviderHeaders } from "@earendil-works/pi-ai"
 import type { AutocompleteItem } from "@earendil-works/pi-tui"
 import type {
   ExtensionAPI,
@@ -11,32 +12,16 @@ import {
   convertToLlm,
   serializeConversation,
 } from "@earendil-works/pi-coding-agent"
-import { pickRecapModel } from "./model-picker.js"
-import {
-  deleteRecapConfig,
-  formatAuthModelKey,
-  formatModelPreference,
-  formatRecapModelKey,
-  getAuthenticatedTextModelPreferences,
-  getRecapModelAuth,
-  resolveInitialModelConfig,
-  saveModelPreference,
-  type RecapModelConfig,
-  type ResolvedRecapModelAuth,
-} from "./models.js"
 import { sanitizeRecapText } from "./sanitize.js"
 import {
-  clearNoModelWarning,
   clearWidget,
   notifyUser,
   showLoadingWidget,
-  showNoModelWarning,
   showWidget,
 } from "./tui.js"
 
 const RECAP_MAX_TOKENS = 160
 const RECAP_REQUEST_TIMEOUT_MS = 4_000
-const AWAY_RECAP_DELAY_MS = 5 * 60 * 1_000
 const RECAP_ENTRY_TYPE = "pi-recap:state"
 
 interface PersistedRecapState {
@@ -69,11 +54,6 @@ const RECAP_SUBCOMMANDS: AutocompleteItem[] = [
     description: "Show model and recap status",
   },
   {
-    value: "config",
-    label: "config",
-    description: "Choose the recap model",
-  },
-  {
     value: "help",
     label: "help",
     description: "List recap commands",
@@ -82,52 +62,39 @@ const RECAP_SUBCOMMANDS: AutocompleteItem[] = [
 
 const RECAP_SYSTEM_PROMPT = `You write compact recaps for an AI coding-agent session.
 
-Given the current session context, produce one plain-text sentence for the user to resume later.
-Explain WHAT was done, decided, investigated, or blocked and WHY: the user's goal, an explicit constraint, a decision rationale, or an evidence-backed root cause.
-Prefer: Done/Decided/Investigating <what> because <why>; <current state>. Next: <action>.
-Choose the verb that matches the session. Use "because" only when the reason is supported by the session; never invent a root cause. If no causal reason is established, use "to <goal>" or omit the reason.
-Include current state, an important decision, touched file, blocker, or likely next action only if it helps resume.
-Target 180–240 characters. Stay under 280 characters.
-Do not add a label or prefix. Do not use markdown. Do not mention yourself as "the assistant".
+Given the current session context, return exactly one natural, human-readable sentence for the user to resume later.
+You must state what happened, why it mattered, and what happens next.
+Use this shape: Done/Decided/Investigating <what> because <why>; next, <action>.
+The reason must be supported by the session: the user's goal, an explicit constraint, a decision rationale, or an evidence-backed root cause. Never invent a reason. If no causal reason is established, use "to <goal>" instead of "because".
+Name current state, an important decision, touched file, or blocker only when it helps explain the next direction of travel.
+Target 180–240 characters. Stay under 280 characters. Do not add a label or prefix, markdown, or a reference to yourself as "the assistant".
 
-Good: Done: added session persistence because recaps were lost on restart; /recap status now restores the latest state.
-Bad: Done: fixed everything because the code was wrong; next: continue.`
+Good: Added session persistence because recaps were lost on restart; next, verify that /recap status restores the latest state.
+Bad: Fixed everything because the code was wrong; next, continue.`
 
 interface RecapState {
   sessionActive: boolean
   runId: number
-  modelConfig: RecapModelConfig
   lastRecap: string
   visible: boolean
-  stale: boolean
   lastRecapCurrent: boolean
   abortController: AbortController | undefined
-  awayTimer: ReturnType<typeof setTimeout> | undefined
 }
 
 function createRecapState(): RecapState {
   return {
     sessionActive: false,
     runId: 0,
-    modelConfig: { kind: "missing" },
     lastRecap: "",
     visible: false,
-    stale: false,
     lastRecapCurrent: false,
     abortController: undefined,
-    awayTimer: undefined,
   }
 }
 
 function abortPendingGeneration(state: RecapState): void {
   state.abortController?.abort()
   state.abortController = undefined
-}
-
-function clearAwayTimer(state: RecapState): void {
-  if (!state.awayTimer) return
-  clearTimeout(state.awayTimer)
-  state.awayTimer = undefined
 }
 
 function hideRecap(ctx: ExtensionContext, state: RecapState): void {
@@ -139,12 +106,9 @@ function resetRecapSession(ctx: ExtensionContext, state: RecapState): void {
   state.runId++
   state.lastRecap = ""
   state.visible = false
-  state.stale = false
   state.lastRecapCurrent = false
-  clearAwayTimer(state)
   abortPendingGeneration(state)
   clearWidget(ctx)
-  clearNoModelWarning(ctx)
 }
 
 function extractTextContent(
@@ -236,6 +200,24 @@ function getCurrentSessionMessages(
     .messages
 }
 
+async function getActiveSessionModelAuth(
+  ctx: ExtensionContext,
+): Promise<
+  | {
+      readonly model: NonNullable<ExtensionContext["model"]>
+      readonly apiKey: string
+      readonly headers: ProviderHeaders | undefined
+    }
+  | undefined
+> {
+  if (!ctx.model) return undefined
+
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model)
+  if (!auth.ok || !auth.apiKey) return undefined
+
+  return { model: ctx.model, apiKey: auth.apiKey, headers: auth.headers }
+}
+
 function buildPrompt(messages: AgentMessage[]): Message {
   const conversationText = serializeConversation(convertToLlm(messages))
   return {
@@ -268,16 +250,16 @@ async function generateRecap(
   if (options.manual) showLoadingWidget(ctx)
 
   const runId = state.runId
-  const modelAuth = await getRecapModelAuth(ctx, state.modelConfig)
+  const auth = await getActiveSessionModelAuth(ctx)
   if (runId !== state.runId || !state.sessionActive) return
 
-  if (modelAuth.status !== "ok") {
-    if (options.manual) clearWidget(ctx)
-    handleMissingRecapModel(ctx, modelAuth, options)
+  if (!auth) {
+    if (options.manual) {
+      clearWidget(ctx)
+      notifyUser(ctx, "No authenticated active session model.", "error")
+    }
     return
   }
-
-  const auth = modelAuth.auth
 
   const abortController = new AbortController()
   abortPendingGeneration(state)
@@ -321,10 +303,8 @@ async function generateRecap(
 
     state.lastRecap = recap
     state.visible = true
-    state.stale = false
     persistRecapState(pi, state, contextLeafId)
     state.lastRecapCurrent = true
-    clearNoModelWarning(ctx)
     showWidget(ctx, recap)
   } catch {
     if (options.manual) {
@@ -339,51 +319,6 @@ async function generateRecap(
   }
 }
 
-function handleMissingRecapModel(
-  ctx: ExtensionContext,
-  modelAuth: Exclude<ResolvedRecapModelAuth, { status: "ok" }>,
-  options: { manual: boolean },
-): void {
-  if (!options.manual) {
-    showNoModelWarning(ctx)
-    return
-  }
-
-  if (modelAuth.status === "invalid-config") {
-    notifyUser(ctx, "Invalid recap model config. Run /recap config.", "error")
-    return
-  }
-
-  if (modelAuth.source === "configured" && modelAuth.model) {
-    notifyUser(
-      ctx,
-      `Recap model is not authenticated: ${formatRecapModelKey(modelAuth.model)}. Run /recap config.`,
-      "error",
-    )
-    return
-  }
-
-  notifyUser(
-    ctx,
-    "No default recap model authenticated. Run /recap config.",
-    "error",
-  )
-}
-
-function scheduleAwayRecap(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  state: RecapState,
-): void {
-  clearAwayTimer(state)
-  state.awayTimer = setTimeout(() => {
-    state.awayTimer = undefined
-    if (!state.sessionActive || !state.stale || !ctx.isIdle()) return
-    state.stale = false
-    void generateRecap(pi, ctx, state, { manual: false })
-  }, AWAY_RECAP_DELAY_MS)
-}
-
 function isRecapCommand(text: string): boolean {
   return /^\/recap(?:\s|$)/u.test(text.trimStart())
 }
@@ -396,53 +331,12 @@ function getRecapArgumentCompletions(
   return items.length > 0 ? items : null
 }
 
-async function configureRecapModel(
-  ctx: ExtensionContext,
-  state: RecapState,
-): Promise<void> {
-  const models = await getAuthenticatedTextModelPreferences(ctx)
-  if (models.length === 0) {
-    notifyUser(
-      ctx,
-      "No authenticated models available. Run /login or configure a model first.",
-      "error",
-    )
-    return
-  }
-
-  const result = await pickRecapModel(ctx, models)
-  if (result.action === "cancel") return
-
-  try {
-    if (result.action === "default") {
-      deleteRecapConfig()
-      state.modelConfig = { kind: "missing" }
-      notifyUser(ctx, "Recap model reset to default.", "info")
-      return
-    }
-
-    saveModelPreference(result.model)
-    state.modelConfig = { kind: "configured", model: result.model }
-    notifyUser(
-      ctx,
-      `Recap model set to ${formatRecapModelKey(result.model)}.`,
-      "info",
-    )
-  } catch (error) {
-    const reason =
-      error instanceof SyntaxError ? "invalid JSON" : "write failed"
-    notifyUser(ctx, `Could not update recap config: ${reason}.`, "error")
-  }
-}
-
 function registerRecapCommand(pi: ExtensionAPI, state: RecapState): void {
   pi.registerCommand("recap", {
     description: "generate a one-line session recap",
     getArgumentCompletions: getRecapArgumentCompletions,
     handler: async (args, ctx) => {
       const action = args.trim().split(/\s+/u)[0]?.toLowerCase() ?? ""
-
-      clearAwayTimer(state)
 
       if (!action) {
         await generateRecap(pi, ctx, state, { manual: true })
@@ -455,8 +349,7 @@ function registerRecapCommand(pi: ExtensionAPI, state: RecapState): void {
           [
             "pi-recap commands",
             "/recap - generate and show a fresh recap",
-            "/recap status - show model and recap status",
-            "/recap config - choose the recap model",
+            "/recap status - show active-model and recap status",
             "/recap help - show this help",
           ].join("\n"),
           "info",
@@ -469,12 +362,7 @@ function registerRecapCommand(pi: ExtensionAPI, state: RecapState): void {
         return
       }
 
-      if (action === "config") {
-        await configureRecapModel(ctx, state)
-        return
-      }
-
-      notifyUser(ctx, "Use /recap [config|help|status]", "error")
+      notifyUser(ctx, "Use /recap [help|status]", "error")
     },
   })
 }
@@ -483,24 +371,9 @@ async function notifyRecapStatus(
   ctx: ExtensionContext,
   state: RecapState,
 ): Promise<void> {
-  let selectedModelLine = `selected model: ${formatModelPreference(state.modelConfig)}`
-  let activeModelLine: string
-
-  try {
-    const modelAuth = await getRecapModelAuth(ctx, state.modelConfig)
-    if (modelAuth.status === "ok") {
-      clearNoModelWarning(ctx)
-      const suffix = modelAuth.source === "default" ? " (default)" : ""
-      selectedModelLine = `selected model: ${formatAuthModelKey(modelAuth.auth)}${suffix}`
-      activeModelLine = `active model: ${formatAuthModelKey(modelAuth.auth)}`
-    } else if (modelAuth.status === "invalid-config") {
-      activeModelLine = "active model: none (invalid config)"
-    } else {
-      activeModelLine = "active model: none"
-    }
-  } catch {
-    activeModelLine = "active model: unknown (auth check failed)"
-  }
+  const activeModelLine = ctx.model
+    ? `active model: ${ctx.model.provider}/${ctx.model.id}`
+    : "active model: none"
 
   const lastRecapStatus = state.lastRecap
     ? state.lastRecapCurrent
@@ -513,7 +386,7 @@ async function notifyRecapStatus(
     ctx,
     [
       "pi-recap status",
-      selectedModelLine,
+      "recap model: active session model",
       activeModelLine,
       lastRecapLine,
       visibleLine,
@@ -529,24 +402,18 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => {
     state.sessionActive = true
-    state.modelConfig = resolveInitialModelConfig()
     resetRecapSession(ctx, state)
     restoreRecapState(ctx, state)
 
-    if (showRestoredRecap(ctx, state)) return
-
-    void generateRecap(pi, ctx, state, { manual: false })
+    showRestoredRecap(ctx, state)
   })
 
   pi.on("input", (event, ctx) => {
     if (event.source === "extension") return { action: "continue" as const }
 
-    clearAwayTimer(state)
-
     if (!isRecapCommand(event.text)) {
       state.lastRecapCurrent = false
       hideRecap(ctx, state)
-      clearNoModelWarning(ctx)
     }
 
     return { action: "continue" as const }
@@ -554,17 +421,14 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("agent_start", (_event, ctx) => {
     state.runId++
-    state.stale = false
     state.lastRecapCurrent = false
-    clearAwayTimer(state)
     abortPendingGeneration(state)
     hideRecap(ctx, state)
-    clearNoModelWarning(ctx)
   })
 
-  pi.on("agent_settled", (_event, ctx) => {
-    state.stale = true
-    scheduleAwayRecap(pi, ctx, state)
+  pi.on("turn_end", async (_event, ctx) => {
+    if (!state.sessionActive) return
+    await generateRecap(pi, ctx, state, { manual: false })
   })
 
   pi.on("session_shutdown", (_event, ctx) => {

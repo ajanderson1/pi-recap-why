@@ -1,7 +1,7 @@
 {
   "name": "@ajanderson/pi-recap-why",
   "version": "0.1.0",
-  "description": "One-line what-and-why session recap for Pi.",
+  "description": "Per-turn what, why, and next-action recaps for Pi using the active session model.",
   "keywords": [
     "pi",
     "pi-extension",
@@ -28,11 +28,23 @@
     "provenance": true
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "pi": {
     "extensions": [
       "./src/index.ts"
     ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.84.3",
+    "@earendil-works/pi-ai": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@earendil-works/pi-tui": "^0.84.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   }
 }
