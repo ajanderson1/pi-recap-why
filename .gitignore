@@ -3,3 +3,7 @@
 
 # Node.js dependencies
 node_modules/
+
+# Machine-local Pi projections and Toolkit state
+/.pi/
+/pi-extensions-lock.json
